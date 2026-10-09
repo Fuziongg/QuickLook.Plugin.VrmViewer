@@ -33,6 +33,8 @@ internal sealed class ModelBuilder
     private readonly Dictionary<int, (BitmapSource Bmp, double Coverage)> _images = new();
     private readonly Dictionary<int, (Material Mat, double Order, bool DoubleSided)> _materials = new();
     private readonly List<(GeometryModel3D Model, double Order)> _parts = new();
+    private readonly Dictionary<int, Matrix3D> _world = new();
+    private readonly List<(int Node, int Mesh)> _meshNodes = new();
 
     public int Triangles { get; private set; }
 
@@ -45,6 +47,8 @@ internal sealed class ModelBuilder
         var scene = scenes.Count > 0 ? (Dictionary<string, object>)scenes[J.Int(glb.Root, "scene", 0)] : null;
         var roots = J.Nums(scene, "nodes") ?? Array.Empty<double>();
         foreach (var n in roots) b.Node((int)n, Matrix3D.Identity);
+        // all world matrices must be known before skinning, joints can come after the mesh in the tree
+        foreach (var (node, mesh) in b._meshNodes) b.Mesh(mesh, node);
 
         var group = new Model3DGroup();
         foreach (var p in b._parts.OrderBy(p => p.Order)) group.Children.Add(p.Model);
@@ -57,13 +61,8 @@ internal sealed class ModelBuilder
     {
         var node = _glb.Item("nodes", index);
         var world = Local(node) * parent;
-
-        if (node.TryGetValue("mesh", out var mesh))
-        {
-            // skinned vertices are already in model space in the bind pose; the node transform doesn't apply
-            var m = node.ContainsKey("skin") ? Matrix3D.Identity : world;
-            Mesh((int)(double)mesh, m);
-        }
+        _world[index] = world;
+        if (node.TryGetValue("mesh", out var mesh)) _meshNodes.Add((index, (int)(double)mesh));
 
         foreach (var c in J.Nums(node, "children") ?? Array.Empty<double>())
             Node((int)c, world);
@@ -86,8 +85,11 @@ internal sealed class ModelBuilder
         return result;
     }
 
-    private void Mesh(int index, Matrix3D transform)
+    private void Mesh(int index, int nodeIndex)
     {
+        var node = _glb.Item("nodes", nodeIndex);
+        var transform = _world[nodeIndex];
+        var joints = node.ContainsKey("skin") ? JointMatrices(J.Int(node, "skin", 0)) : null;
         var mesh = _glb.Item("meshes", index);
         foreach (Dictionary<string, object> prim in (List<object>)mesh["primitives"])
         {
@@ -102,19 +104,29 @@ internal sealed class ModelBuilder
             var vertexCount = pos.Length / 3;
             var indices = prim.ContainsKey("indices") ? _glb.Indices(J.Int(prim, "indices", 0)) : Sequence(vertexCount);
 
+            float[] jointIds = null, weights = null;
+            if (joints != null && attrs.ContainsKey("JOINTS_0") && attrs.ContainsKey("WEIGHTS_0"))
+            {
+                jointIds = _glb.Floats(J.Int(attrs, "JOINTS_0", 0), out _);
+                weights = _glb.Floats(J.Int(attrs, "WEIGHTS_0", 0), out _);
+            }
+
             var geo = new MeshGeometry3D();
             var points = new Point3DCollection(vertexCount);
+            var nc = normals != null ? new Vector3DCollection(vertexCount) : null;
             for (var i = 0; i < vertexCount; i++)
-                points.Add(transform.Transform(new Point3D(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2])));
-            geo.Positions = points;
-
-            if (normals != null)
             {
-                var nc = new Vector3DCollection(vertexCount);
-                for (var i = 0; i < vertexCount; i++)
-                    nc.Add(transform.Transform(new Vector3D(normals[i * 3], normals[i * 3 + 1], normals[i * 3 + 2])));
-                geo.Normals = nc;
+                var m = jointIds != null ? Skin(joints, jointIds, weights, i) : transform;
+                points.Add(m.Transform(new Point3D(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2])));
+                if (nc != null)
+                {
+                    var n = m.Transform(new Vector3D(normals[i * 3], normals[i * 3 + 1], normals[i * 3 + 2]));
+                    n.Normalize();
+                    nc.Add(n);
+                }
             }
+            geo.Positions = points;
+            if (nc != null) geo.Normals = nc;
 
             if (uvs != null)
             {
@@ -133,6 +145,47 @@ internal sealed class ModelBuilder
             if (mat.DoubleSided) model.BackMaterial = mat.Mat;
             _parts.Add((model, mat.Order));
         }
+    }
+
+    // rest pose of a skinned mesh: jointWorld * inverseBind per joint, blended by the vertex weights
+    private Matrix3D[] JointMatrices(int skinIndex)
+    {
+        var skin = _glb.Item("skins", skinIndex);
+        var ids = J.Nums(skin, "joints") ?? Array.Empty<double>();
+        var inv = skin.ContainsKey("inverseBindMatrices") ? _glb.Floats(J.Int(skin, "inverseBindMatrices", 0), out _) : null;
+        var result = new Matrix3D[ids.Length];
+        for (var j = 0; j < ids.Length; j++)
+        {
+            var ib = Matrix3D.Identity;
+            if (inv != null)
+            {
+                var o = j * 16;
+                ib = new Matrix3D(inv[o], inv[o + 1], inv[o + 2], inv[o + 3], inv[o + 4], inv[o + 5], inv[o + 6], inv[o + 7],
+                    inv[o + 8], inv[o + 9], inv[o + 10], inv[o + 11], inv[o + 12], inv[o + 13], inv[o + 14], inv[o + 15]);
+            }
+            result[j] = ib * (_world.TryGetValue((int)ids[j], out var w) ? w : Matrix3D.Identity);
+        }
+        return result;
+    }
+
+    private static Matrix3D Skin(Matrix3D[] joints, float[] ids, float[] weights, int vertex)
+    {
+        double m11 = 0, m12 = 0, m13 = 0, m21 = 0, m22 = 0, m23 = 0, m31 = 0, m32 = 0, m33 = 0, ox = 0, oy = 0, oz = 0, total = 0;
+        for (var k = 0; k < 4; k++)
+        {
+            var w = weights[vertex * 4 + k];
+            var j = (int)ids[vertex * 4 + k];
+            if (w <= 0 || j >= joints.Length) continue;
+            var m = joints[j];
+            m11 += w * m.M11; m12 += w * m.M12; m13 += w * m.M13;
+            m21 += w * m.M21; m22 += w * m.M22; m23 += w * m.M23;
+            m31 += w * m.M31; m32 += w * m.M32; m33 += w * m.M33;
+            ox += w * m.OffsetX; oy += w * m.OffsetY; oz += w * m.OffsetZ;
+            total += w;
+        }
+        if (total <= 0) return Matrix3D.Identity;
+        return new Matrix3D(m11 / total, m12 / total, m13 / total, 0, m21 / total, m22 / total, m23 / total, 0,
+            m31 / total, m32 / total, m33 / total, 0, ox / total, oy / total, oz / total, 1);
     }
 
     private static int[] Sequence(int n)

@@ -2,6 +2,10 @@
 
 Previews VRM avatars (`.vrm`) in [QuickLook](https://github.com/QL-Win/QuickLook): select the file, press Space and the model shows up turning around, with its name, author and license underneath.
 
+![screenshot](docs/screenshot.png)
+
+<sub>Model in the screenshot: [Seed-san](https://github.com/vrm-c/vrm-specification/tree/master/samples/Seed-san) by VirtualCast, Inc., VRM Public License 1.0.</sub>
+
 - Textured model, all meshes, in the rest pose
 - Name, author and license read from the VRM metadata (VRM 0.x and 1.0)
 - Drag to orbit, scroll to zoom; grabbing the model stops the turntable

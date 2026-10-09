@@ -32,6 +32,8 @@ internal sealed class VrmPanel : Grid
     private readonly TextBlock _details;
     private readonly TextBlock _error;
     private readonly VrmMeta _meta;
+    private Rect3D _frame = Rect3D.Empty;
+    private bool _touched;
 
     public VrmPanel(VrmMeta meta, string fileName)
     {
@@ -44,6 +46,7 @@ internal sealed class VrmPanel : Grid
             Background = Brushes.Transparent,
             ShowViewCube = false,
             ShowCoordinateSystem = false,
+            ShowCameraTarget = false,
             IsHeadLightEnabled = false,
             ModelUpDirection = new Vector3D(0, 1, 0),
             RotateGesture = new MouseGesture(MouseAction.LeftClick),
@@ -62,7 +65,13 @@ internal sealed class VrmPanel : Grid
         });
         _viewport.Children.Add(_modelVisual);
         // once the user grabs the model, stop turning it so it stays where they put it
-        _viewport.PreviewMouseDown += (_, _) => StopSpin();
+        _viewport.PreviewMouseDown += (_, _) =>
+        {
+            _touched = true;
+            StopSpin();
+        };
+        // the window often resizes right after the content arrives; refit until the user takes over
+        _viewport.SizeChanged += (_, _) => Fit();
         Children.Add(_viewport);
 
         _error = new TextBlock { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(24), Visibility = Visibility.Collapsed };
@@ -99,6 +108,9 @@ internal sealed class VrmPanel : Grid
     {
         var b = model.Bounds;
         var center = new Point3D(b.X + b.SizeX / 2, b.Y + b.SizeY / 2, b.Z + b.SizeZ / 2);
+        // a box that holds the model at any turntable angle, so the framing doesn't depend on when it's measured
+        var r = Math.Sqrt(b.SizeX * b.SizeX + b.SizeZ * b.SizeZ) / 2;
+        _frame = new Rect3D(center.X - r, b.Y, center.Z - r, 2 * r, b.SizeY, 2 * r);
         _modelVisual.Content = new Model3DGroup
         {
             Children = { model },
@@ -113,8 +125,14 @@ internal sealed class VrmPanel : Grid
             RepeatBehavior = RepeatBehavior.Forever,
         });
 
-        if (_viewport.IsLoaded) _viewport.ZoomExtents();
-        else _viewport.Loaded += (_, _) => _viewport.ZoomExtents();
+        if (_viewport.IsLoaded) Fit();
+        else _viewport.Loaded += (_, _) => Fit();
+    }
+
+    private void Fit()
+    {
+        if (_touched || _frame.IsEmpty || _viewport.ActualWidth < 1) return;
+        _viewport.ZoomExtents(_frame);
     }
 
     public void ShowError(string message)
